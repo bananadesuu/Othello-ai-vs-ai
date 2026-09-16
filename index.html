@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>オセロAI対AIデモ</title>
+  <style>
+    :root {
+      --bg: #f4f4f9;
+      --fg: #333;
+      --green: #008000;
+      --green2: #00a000;
+      --panel: #f0e68c;
+    }
+    html, body { height: 100%; }
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;
+      background: var(--bg);
+      color: var(--fg);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: flex-start;
+      padding: 12px;
+    }
+    h1 { font-size: 1.1rem; margin: 6px 0 8px; }
+    #controls {
+      display: flex; gap: 8px; flex-wrap: wrap; justify-content: center;
+      margin: 6px 0 12px;
+    }
+    button {
+      padding: 10px 14px;
+      border: 0;
+      border-radius: 8px;
+      background: #ffffff;
+      box-shadow: 0 2px 6px rgba(0,0,0,.15);
+      font-size: 14px;
+    }
+    button:active { transform: scale(0.98); }
+    #board {
+      border-collapse: collapse;
+      box-shadow: 0 6px 18px rgba(0,0,0,.25);
+      background: #008000;
+      touch-action: manipulation;
+    }
+    #board td {
+      width: min(12vmin, 64px);
+      height: min(12vmin, 64px);
+      border: 1px solid #333;
+      text-align: center;
+      vertical-align: middle;
+      position: relative;
+      user-select: none;
+    }
+    .cell {
+      width: 100%; height: 100%;
+    }
+    .piece {
+      width: 84%; height: 84%;
+      border-radius: 999px;
+      display: inline-block;
+      box-shadow: inset 2px 2px 4px rgba(0,0,0,.6);
+    }
+    .black { background: #000; }
+    .white { background: #fff; }
+    .highlight { outline: 2px solid rgba(255,255,0,.7); outline-offset: -2px; }
+    #status { margin: 12px 0 6px; font-weight: bold; }
+    #learning-info {
+      margin: 6px 0 14px;
+      padding: 10px;
+      background: var(--panel);
+      border-radius: 6px;
+    }
+    @media (max-width: 720px) {
+      #board td { width: 9.5vmin; height: 9.5vmin; }
+    }
+  </style>
+</head>
+<body>
+  <h1>オセロAI対AIデモ（iPad優先）</h1>
+
+  <div id="status">初期化中…</div>
+
+  <div id="learning-info">AI学習中: 進行状況はUIで表示します。</div>
+
+  <div id="controls">
+    <button id="pauseBtn" aria-label="Pause">一時停止</button>
+    <button id="playBtn" aria-label="Play" style="display:none;">再生</button>
+    <button id="resetBtn" aria-label="Reset">リセット</button>
+  </div>
+
+  <table id="board" aria-label="オセロ盤"></table>
+
+  <script>
+    // 基本設定
+    const BOARD_SIZE = 8;
+    const BLACK = 1;
+    const WHITE = 2;
+    const EMPTY = 0;
+
+    // UI/状態
+    const statusEl = document.getElementById('status');
+    const boardEl = document.getElementById('board');
+    const learningEl = document.getElementById('learning-info');
+    const pauseBtn = document.getElementById('pauseBtn');
+    const playBtn  = document.getElementById('playBtn');
+    const resetBtn = document.getElementById('resetBtn');
+
+    // AI設定
+    const TIME_LIMIT = 60; // ms per move分割 thinking の総制限ではなく段階ごとの分解の目安
+    // 深さを動的に増やしていく簡易実装
+    let depthLimit = 1;
+
+    // 状態
+    let board;
+    let currentPlayer;
+    let isGameActive = false;
+    let isAITurn = false;
+    let paused = false;
+    let thinkingPromise = null; // 現在の思考時の約束
+
+    // Transposition and eval
+    let transpositionTable = new Map();
+    let evaluationWeights = [
+      [ 100, -20,  10,   5,   5,  10, -20, 100],
+      [-20,  -50,  -2,  -2,  -2,  -2, -50, -20],
+      [ 10,   -2,   1,   1,   1,   1,  -2,  10],
+      [  5,   -2,   1,   0,   0,   1,  -2,   5],
+      [  5,   -2,   1,   0,   0,   1,  -2,   5],
+      [ 10,   -2,   1,   1,   1,  1,  -2,  10],
+      [-20,  -50,  -2,  -2,  -2,  -2, -50, -20],
+      [ 100, -20,  10,   5,   5,  10, -20, 100]
+    ];
+
+    const DIRECTIONS = [
+      [-1,0], [-1,1], [0,1], [1,1],
+      [1,0], [1,-1], [0,-1], [-1,-1]
+    ];
+
+    // 初期盤面作成
+    function initBoard() {
+      board = Array(BOARD_SIZE).fill(0).map(() => Array(BOARD_SIZE).fill(EMPTY));
+      board[3][3] = WHITE;
+      board[3][4] = BLACK;
+      board[4][3] = BLACK;
+      board[4][4] = WHITE;
+      currentPlayer = BLACK;
+      transpositionTable.clear();
+    }
+
+    // 深いコピー
+    function copyBoard(b) {
+      return b.map(r => r.slice());
+    }
+
+    // 探索関数
+    function getFlippableDiscs(b, r, c, p) {
+      const o = 3 - p;
+      let flips = [];
+      if (b[r][c] !== EMPTY) return flips;
+      for (const [dr, dc] of DIRECTIONS) {
+        let path = [];
+        let rr = r + dr, cc = c + dc;
+        while (rr >= 0 && rr < BOARD_SIZE && cc >= 0 && cc < BOARD_SIZE && b[rr][cc] === o) {
+          path.push({r: rr, c: cc});
+          rr += dr; cc += dc;
+        }
+        if (rr >= 0 && rr < BOARD_SIZE && cc >= 0 && cc < BOARD_SIZE && b[rr][cc] === p) {
+          flips = flips.concat(path);
+        }
+      }
+      return flips;
+    }
+
+    function isValidMove(b, r, c, p) {
+      if (r < 0 || r >= BOARD_SIZE || c < 0 || c >= BOARD_SIZE) return false;
+      if (b[r][c] !== EMPTY) return false;
+      return getFlippableDiscs(b, r, c, p).length > 0;
+    }
+
+    function doMove(b, r, c, p) {
+      const flips = getFlippableDiscs(b, r, c, p);
+      if (flips.length === 0) return false;
+      b[r][c] = p;
+      for (const f of flips) b[f.r][f.c] = p;
+      return true;
+    }
+
+    function getValidMoves(b, p) {
+      const moves = [];
+      for (let r = 0; r < BOARD_SIZE; r++) {
+        for (let c = 0; c < BOARD_SIZE; c++) {
+          if (isValidMove(b, r, c, p)) moves.push({r, c});
+        }
+      }
+      return moves;
+    }
+
+    function isGameOver(b) {
+      return getValidMoves(b, BLACK).length === 0 && getValidMoves(b, WHITE).length === 0;
+    }
+
+    function getWinner(b) {
+      const black = b.flat().filter(x => x === BLACK).length;
+      const white = b.flat().filter(x => x === WHITE).length;
+      if (black > white) return BLACK;
+      if (white > black) return WHITE;
+      return EMPTY;
+    }
+
+    function evaluateBoard(b, p) {
+      const o = 3 - p;
+      let score = 0;
+      let total = 0;
+      for (let r=0;r<BOARD_SIZE;r++){
+        for (let c=0;c<BOARD_SIZE;c++){
+          if (b[r][c] !== EMPTY) total++;
+          if (b[r][c] === p) score += evaluationWeights[r][c];
+          else if (b[r][c] === o) score -= evaluationWeights[r][c];
+        }
+      }
+      const myMoves = getValidMoves(b, p).length;
+      const oppMoves = getValidMoves(b, o).length;
+      score += 20 * (myMoves - oppMoves);
+      const myPieces = b.flat().filter(v => v === p).length;
+      const oppPieces = b.flat().filter(v => v === o).length;
+      const phase = total < 50 ? 1 : 50;
+      score += phase * (myPieces - oppPieces);
+      return score;
+    }
+
+    // ミニマックス(簡易版)
+    function minimax(b, depth, alpha, beta, maximizing) {
+      if (depth === 0 || isGameOver(b)) {
+        return evaluateBoard(b, WHITE);
+      }
+      const p = maximizing ? WHITE : BLACK;
+      const moves = getValidMoves(b, p);
+      if (moves.length === 0) {
+        // パス
+        return minimax(b, depth-1, alpha, beta, !maximizing);
+      }
+
+      // simple TT
+      const hash = b.flat().join('');
+      const ent = transpositionTable.get(hash);
+      // 簡易無効化のため省略
+
+      let best = maximizing ? -Infinity : Infinity;
+      for (const mv of moves) {
+        const nb = copyBoard(b);
+        doMove(nb, mv.r, mv.c, p);
+        const val = minimax(nb, depth-1, alpha, beta, !maximizing);
+        if (maximizing) {
+          best = Math.max(best, val);
+          alpha = Math.max(alpha, best);
+        } else {
+          best = Math.min(best, val);
+          beta = Math.min(beta, best);
+        }
+        if (beta <= alpha) break;
+      }
+      return best;
+    }
+
+    async function thinkMove(aiColor, baseBoard, onDone) {
+      // 非同期思考: 深さを動的に上げつつ、少しずつ進める
+      const maxTotalDepth = 6;
+      const moves = getValidMoves(baseBoard, aiColor);
+      if (moves.length === 0) { onDone(null); return; }
+
+      let bestMove = moves[0];
+      for (let d = 1; d <= maxTotalDepth; d++) {
+        // 多少の待機を挟んでUI応答を維持
+        const nb = copyBoard(baseBoard);
+        for (const mv of moves) {
+          const testBoard = copyBoard(nb);
+          doMove(testBoard, mv.r, mv.c, aiColor);
+          const score = minimax(testBoard, d-1, -Infinity, Infinity, false);
+          if (score > minimax(nb, d-1, -Infinity, Infinity, true)) {
+            bestMove = mv;
+          }
+        }
+        // 短時間待機
+        const t0 = performance.now();
+        while (performance.now() - t0 < 0) { /* no-op */ }
+        if (paused) { onDone(null); return; }
+        // 再評価
+      }
+      onDone(bestMove);
+    }
+
+    function renderBoard(highlightMoves = true) {
+      boardEl.innerHTML = '';
+      const moves = getValidMoves(board, BLACK);
+      for (let r=0; r<BOARD_SIZE; r++) {
+        const row = boardEl.insertRow();
+        for (let c=0; c<BOARD_SIZE; c++) {
+          const cell = row.insertCell();
+          cell.className = 'cell';
+          if (board[r][c] === BLACK) cell.innerHTML = '<span class="piece black"></span>';
+          else if (board[r][c] === WHITE) cell.innerHTML = '<span class="piece white"></span>';
+          // クリックイベントはAI対AIの為不要
+          cell.style.padding = 0;
+          if (highlightMoves) {
+            const isAvail = moves.some(m => m.r===r && m.c===c);
+            if (isAvail) cell.classList.add('highlight');
+          }
+        }
+      }
+    }
+
+    function updateStatus() {
+      const bMoves = getValidMoves(board, BLACK);
+      const wMoves = getValidMoves(board, WHITE);
+      let txt = `黒: ${board.flat().filter(v=>v===BLACK).length} 白: ${board.flat().filter(v=>v===WHITE).length} | `;
+      if (isGameOver(board)) {
+        isGameActive = false;
+        const win = getWinner(board);
+        if (win === BLACK) txt += '黒の勝利';
+        else if (win === WHITE) txt += '白の勝利';
+        else txt += '引き分け';
+      } else if (bMoves.length === 0 && wMoves.length > 0) {
+        txt += '黒は置けずパス';
+      } else {
+        txt += '黒の番';
+      }
+      statusEl.textContent = txt;
+    }
+
+    // AI対AIループ
+    async function runAIVSA() {
+      if (!isGameActive) return;
+      if (paused) return;
+
+      // 黒 AI → 更新 → 白 AI → 更新 の循環
+      // 黒思考
+      thinkingPromise = new Promise(resolve => {
+        thinkMove(BLACK, board, (mv) => {
+          if (mv) {
+            doMove(board, mv.r, mv.c, BLACK);
+          }
+          resolve();
+        });
+      });
+      await thinkingPromise;
+      // 更新
+      renderBoard();
+      updateStatus();
+      if (isGameOver(board)) { isGameActive = false; updateStatus(); return; }
+
+      if (paused) return;
+
+      // 白思考
+      thinkingPromise = new Promise(resolve => {
+        thinkMove(WHITE, board, (mv) => {
+          if (mv) {
+            doMove(board, mv.r, mv.c, WHITE);
+          }
+          resolve();
+        });
+      });
+      await thinkingPromise;
+      renderBoard();
+      updateStatus();
+      if (isGameOver(board)) { isGameActive = false; updateStatus(); return; }
+
+      // 次ループ
+      if (!paused) {
+        requestAnimationFrame(runAIVSA);
+      }
+    }
+
+    // UIイベント
+    function resetAll() {
+      paused = false;
+      depthLimit = 1;
+      initBoard();
+      isGameActive = true;
+      renderBoard();
+      updateStatus();
+      // 開始
+      requestAnimationFrame(runAIVSA);
+      pauseBtn.style.display = 'inline-block';
+      playBtn.style.display = 'none';
+      learningEl.textContent = 'AI学習中: 初期状態から開始';
+    }
+
+    pauseBtn.addEventListener('click', () => {
+      paused = true;
+      pauseBtn.style.display = 'none';
+      playBtn.style.display = 'inline-block';
+    });
+
+    playBtn.addEventListener('click', () => {
+      paused = false;
+      playBtn.style.display = 'none';
+      pauseBtn.style.display = 'inline-block';
+      // 再開
+      requestAnimationFrame(runAIVSA);
+    });
+
+    resetBtn.addEventListener('click', () => {
+      resetAll();
+    });
+
+    // 初期化/起動
+    function initAndStart() {
+      initBoard();
+      renderBoard();
+      updateStatus();
+      isGameActive = true;
+      // 自動開始
+      requestAnimationFrame(runAIVSA);
+      pauseBtn.style.display = 'inline-block';
+      playBtn.style.display = 'none';
+    }
+
+    // 起動
+    window.addEventListener('load', () => {
+      learningEl.textContent = 'AI対AIデモを起動します…';
+      // 少し待ってから開始
+      setTimeout(() => {
+        initAndStart();
+        learningEl.textContent = 'AI対AIデモ稼働中（ pause/ play で制御）';
+      }, 100);
+    });
+
+    // 保守: タッチ優先の軽いイベントを盤上に追加したい場合はここに
+  </script>
+</body>
+</html>
